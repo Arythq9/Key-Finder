@@ -540,12 +540,7 @@ render_results()
 
 st.markdown(
     """
-<div class="aryth-footer">
-<hr>
-アップロード音源は解析処理にのみ使用し、
-一時ファイルは解析終了後に削除します。
-権利を有する音源、または解析が許可されている音源を使用してください。
-</div>
+
 """,
     unsafe_allow_html=True,
 )
