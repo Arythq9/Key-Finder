@@ -389,8 +389,6 @@ st.markdown(
     <span class="aryth-badge">{APP_VERSION}</span>
     <span class="aryth-badge">Major＝長調＝Camelot B</span>
     <span class="aryth-badge">Minor＝短調＝Camelot A</span>
-    <span class="aryth-badge">複数転調・復帰対応</span>
-    <span class="aryth-badge">BPMなし・キー特化</span>
   </div>
 </section>
 """,
