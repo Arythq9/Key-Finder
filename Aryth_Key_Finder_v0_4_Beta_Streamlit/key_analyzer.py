@@ -60,6 +60,30 @@ TEMPERLEY_MINOR = np.array(
     dtype=np.float64,
 )
 
+# Shaath (KeyFinder) — ポップス／ダンス音源の録音から作られたプロファイル。
+# Camelot表記を使う用途とも相性が良いため、本ツールでは主軸に置く。
+SHAATH_MAJOR = np.array(
+    [6.6, 2.0, 3.5, 2.3, 4.6, 4.0, 2.5, 5.2, 2.4, 3.7, 2.3, 3.4],
+    dtype=np.float64,
+)
+SHAATH_MINOR = np.array(
+    [6.5, 2.7, 3.5, 5.4, 2.6, 3.5, 2.5, 5.2, 4.0, 2.7, 4.3, 3.2],
+    dtype=np.float64,
+)
+
+# Albrecht & Shanahan — 大規模コーパスから推定されたプロファイル。
+# 非和声音に強く、借用和音の多い曲で主音がぶれにくい。
+ALBRECHT_MAJOR = np.array(
+    [0.238, 0.006, 0.111, 0.006, 0.137, 0.094,
+     0.016, 0.214, 0.009, 0.080, 0.008, 0.081],
+    dtype=np.float64,
+)
+ALBRECHT_MINOR = np.array(
+    [0.220, 0.006, 0.104, 0.123, 0.019, 0.103,
+     0.012, 0.214, 0.062, 0.022, 0.061, 0.052],
+    dtype=np.float64,
+)
+
 # 低音域では主音・属音・下属音を少し重視する
 BASS_MAJOR = np.array(
     [1.00, 0.06, 0.25, 0.06, 0.28, 0.42, 0.06, 0.78, 0.06, 0.22, 0.06, 0.18],
@@ -96,7 +120,8 @@ SENSITIVITY_SETTINGS = {
         "minimum_structure": 0.35,
         "minimum_segment_seconds": 20.0,
         "minimum_boundary_gap": 22.0,
-        "transition_penalty": 1.02,
+        "transition_penalty": 1.55,
+        "minimum_scale_change": 0.030,
     },
     "標準": {
         "candidate_threshold": 0.46,
@@ -104,7 +129,8 @@ SENSITIVITY_SETTINGS = {
         "minimum_structure": 0.25,
         "minimum_segment_seconds": 14.0,
         "minimum_boundary_gap": 14.0,
-        "transition_penalty": 0.84,
+        "transition_penalty": 1.20,
+        "minimum_scale_change": 0.018,
     },
     "高め（短い転調も拾う）": {
         "candidate_threshold": 0.36,
@@ -112,9 +138,14 @@ SENSITIVITY_SETTINGS = {
         "minimum_structure": 0.18,
         "minimum_segment_seconds": 10.0,
         "minimum_boundary_gap": 10.0,
-        "transition_penalty": 0.68,
+        "transition_penalty": 0.95,
+        "minimum_scale_change": 0.009,
     },
 }
+
+# 構成音の入れ替わりを「転調あり」とみなす目安。
+# クロマは合計1に正規化されているので、1音あたり0.02動けば十分大きい。
+SCALE_CHANGE_SCALE = 0.075
 
 
 def _standardize(values: np.ndarray) -> np.ndarray:
@@ -133,7 +164,21 @@ def _build_templates(major: np.ndarray, minor: np.ndarray) -> np.ndarray:
 
 KRUMHANSL_TEMPLATES = _build_templates(KRUMHANSL_MAJOR, KRUMHANSL_MINOR)
 TEMPERLEY_TEMPLATES = _build_templates(TEMPERLEY_MAJOR, TEMPERLEY_MINOR)
+SHAATH_TEMPLATES = _build_templates(SHAATH_MAJOR, SHAATH_MINOR)
+ALBRECHT_TEMPLATES = _build_templates(ALBRECHT_MAJOR, ALBRECHT_MINOR)
 BASS_TEMPLATES = _build_templates(BASS_MAJOR, BASS_MINOR)
+
+# 長音階の構成音マスク（Cメジャー基準）。転調判定で音階そのものの
+# 入れ替わりを確認するために使う。
+MAJOR_SCALE_MASK = np.array(
+    [True, False, True, False, True, True,
+     False, True, False, True, False, True],
+)
+
+
+def scale_membership(tonic: int) -> np.ndarray:
+    """長音階（＝相対短調と共通の構成音）の集合を返す。"""
+    return np.roll(MAJOR_SCALE_MASK, int(tonic) % 12)
 
 
 def pitch_name(tonic: int, notation: str) -> str:
@@ -226,12 +271,23 @@ def ensemble_key_scores(
     bass_chroma: np.ndarray,
 ) -> np.ndarray:
     """
-    従来の全音域判定を主役にし、曖昧な場合だけ低音域の情報を強める。
-    転調しない曲での既存精度を崩しにくい設計。
+    全音域のプロファイル一致を主役にし、曖昧な場合だけ低音域の情報を強める。
+
+    プロファイルはポップス寄りのShaathを主軸に、
+    コーパス由来のAlbrecht、古典寄りのTemperley／Krumhanslを混ぜる。
+    Krumhansl単体は探索実験由来で、ポップスでは属調・相対調へ寄りやすい。
     """
     krumhansl_scores = profile_scores(full_chroma, KRUMHANSL_TEMPLATES)
     temperley_scores = profile_scores(full_chroma, TEMPERLEY_TEMPLATES)
-    base_scores = 0.76 * krumhansl_scores + 0.24 * temperley_scores
+    shaath_scores = profile_scores(full_chroma, SHAATH_TEMPLATES)
+    albrecht_scores = profile_scores(full_chroma, ALBRECHT_TEMPLATES)
+
+    base_scores = (
+        0.36 * shaath_scores
+        + 0.25 * albrecht_scores
+        + 0.22 * temperley_scores
+        + 0.17 * krumhansl_scores
+    )
 
     ranking = np.argsort(base_scores)[::-1]
     base_margin = float(base_scores[ranking[0]] - base_scores[ranking[1]])
@@ -247,6 +303,68 @@ def ensemble_key_scores(
 
     bass_scores = profile_scores(bass_chroma, BASS_TEMPLATES)
     return base_scores + bass_weight * bass_scores
+
+
+def scale_change_evidence(
+    before_chroma: np.ndarray,
+    after_chroma: np.ndarray,
+    before_key: int,
+    shift: int,
+) -> float:
+    """
+    「音階の構成音そのものが入れ替わったか」を測る。
+
+    コード進行の重心がⅠからⅣ・Ⅴへ移っただけの区間は、
+    クロマ全体の相関では±5半音の移調に見えてしまう。
+    一方で本当に転調していれば、新しい調にしか無い音（C→Gの
+    F♯など）が現れ、元の調にしか無い音（F）が減る。
+    その増減だけを直接見ることで、進行の偏りと転調を切り分ける。
+    """
+    shift = int(shift) % 12
+
+    if shift == 0:
+        return 0.0
+
+    family = harmonic_family(int(before_key))
+    before_set = scale_membership(family)
+    after_set = scale_membership(family + shift)
+
+    gained = after_set & ~before_set
+    lost = before_set & ~after_set
+
+    if not gained.any() or not lost.any():
+        return 0.0
+
+    before_chroma = np.asarray(before_chroma, dtype=np.float64)
+    after_chroma = np.asarray(after_chroma, dtype=np.float64)
+
+    gained_delta = float(
+        np.mean(after_chroma[gained] - before_chroma[gained])
+    )
+    lost_delta = float(
+        np.mean(before_chroma[lost] - after_chroma[lost])
+    )
+
+    return gained_delta + lost_delta
+
+
+def scale_change_profile(
+    before_chroma: np.ndarray,
+    after_chroma: np.ndarray,
+    before_key: int,
+) -> np.ndarray:
+    return np.array(
+        [
+            scale_change_evidence(
+                before_chroma,
+                after_chroma,
+                before_key,
+                shift,
+            )
+            for shift in range(12)
+        ],
+        dtype=np.float64,
+    )
 
 
 def key_confidence(scores: np.ndarray) -> float:
@@ -455,9 +573,20 @@ def hybrid_shift_analysis(
         dtype=np.float64,
     )
 
+    before_winner = int(np.argmax(before_scores))
+    after_winner = int(np.argmax(after_scores))
+
+    scale_change = scale_change_profile(
+        before_full,
+        after_full,
+        before_winner,
+    )
+    scale_support = np.clip(scale_change / SCALE_CHANGE_SCALE, -1.0, 1.0)
+
     combined_alignment = (
-        0.56 * chroma_alignment
-        + 0.44 * key_alignment
+        0.52 * chroma_alignment
+        + 0.38 * key_alignment
+        + 0.10 * (0.5 + 0.5 * scale_support)
     )
 
     nonzero_ranking = np.argsort(combined_alignment[1:])[::-1] + 1
@@ -469,8 +598,6 @@ def hybrid_shift_analysis(
     )
     hybrid_gain = best_nonzero_alignment - same_alignment
 
-    before_winner = int(np.argmax(before_scores))
-    after_winner = int(np.argmax(after_scores))
     direct_shift = (
         KEY_LABELS[after_winner][0]
         - KEY_LABELS[before_winner][0]
@@ -513,19 +640,24 @@ def hybrid_shift_analysis(
         )
     )
 
+    best_scale_support = float(
+        np.clip(scale_support[best_nonzero_shift], -1.0, 1.0)
+    )
+
     shift_strength = float(
         np.clip(
-            0.48 * np.clip(
+            0.36 * np.clip(
                 (hybrid_gain - 0.002) / 0.105,
                 0.0,
                 1.0,
             )
-            + 0.23 * np.clip(
+            + 0.18 * np.clip(
                 (best_nonzero_alignment - 0.54) / 0.38,
                 0.0,
                 1.0,
             )
-            + 0.29 * structural_strength,
+            + 0.22 * structural_strength
+            + 0.24 * np.clip(best_scale_support, 0.0, 1.0),
             0.0,
             1.0,
         )
@@ -533,6 +665,11 @@ def hybrid_shift_analysis(
 
     return {
         **chroma_result,
+        "scale_change": scale_change,
+        "scale_support": scale_support,
+        "scale_change_evidence": float(
+            scale_change[best_nonzero_shift]
+        ),
         "before_scores": before_scores,
         "after_scores": after_scores,
         "before_winner": before_winner,
@@ -648,6 +785,21 @@ def combine_multiscale_analyses(
         weights=weights,
     )
 
+    # 構成音の入れ替わりは時間幅を変えても一貫して出るはずなので、
+    # 全スケールの中で最も弱い値を採用して過検出を抑える。
+    scale_change_stack = np.stack(
+        [
+            np.asarray(analysis["scale_change"], dtype=np.float64)
+            for analysis in analyses
+        ]
+    )
+    scale_change = np.min(scale_change_stack, axis=0)
+    scale_support = np.clip(
+        scale_change / SCALE_CHANGE_SCALE,
+        -1.0,
+        1.0,
+    )
+
     same_alignment = float(combined_alignment[0])
     best_nonzero_alignment = float(
         combined_alignment[chosen_shift]
@@ -658,6 +810,9 @@ def combine_multiscale_analyses(
         "shift": chosen_shift,
         "best_nonzero_shift": chosen_shift,
         "combined_alignment": combined_alignment,
+        "scale_change": scale_change,
+        "scale_support": scale_support,
+        "scale_change_evidence": float(scale_change[chosen_shift]),
         "same_alignment": same_alignment,
         "best_nonzero_alignment": best_nonzero_alignment,
         "hybrid_gain": (
@@ -768,7 +923,18 @@ def scan_change_candidates(
             and combined["best_nonzero_alignment"] >= 0.48
         )
 
-        if primary_pass or structural_fallback:
+        # 構成音が実際に入れ替わっていない候補は、コード進行の重心移動と
+        # 見なして早い段階で落とす。5度方向はとくに紛れやすいので厳しく。
+        scale_evidence = float(combined["scale_change_evidence"])
+        scale_floor = float(settings["minimum_scale_change"])
+        chosen_shift = int(combined["shift"]) % 12
+
+        if chosen_shift in FIFTH_SHIFTS:
+            scale_gate = scale_evidence >= scale_floor
+        else:
+            scale_gate = scale_evidence >= scale_floor * 0.35
+
+        if scale_gate and (primary_pass or structural_fallback):
             candidates.append(
                 {
                     "time": float(time_seconds),
@@ -1032,6 +1198,10 @@ def shift_aware_boundary_pass(
         boundary.get("matching_scale_count", 1)
     )
     quality = boundary_confidence(boundary)
+    scale_evidence = float(
+        boundary.get("scale_change_evidence", 0.0)
+    )
+    scale_floor = float(settings["minimum_scale_change"])
 
     base_primary = (
         gain >= settings["minimum_gain"] * 0.65
@@ -1045,8 +1215,10 @@ def shift_aware_boundary_pass(
 
     if shift in FIFTH_SHIFTS:
         # ±5半音は属調・下属調、コード構成音の変化でも出やすい。
+        # 調号が1つ動いたこと（F→F♯など）を必須条件にする。
         return bool(
-            quality >= 76.0
+            scale_evidence >= scale_floor * 1.6
+            and quality >= 76.0
             and alignment >= 0.62
             and structural >= max(
                 0.40,
@@ -1061,7 +1233,8 @@ def shift_aware_boundary_pass(
     if shift in SEMITONE_SHIFTS:
         # 短い終盤転調を落としにくくする
         return bool(
-            alignment >= 0.52
+            scale_evidence >= scale_floor * 0.45
+            and alignment >= 0.52
             and (
                 gain >= settings["minimum_gain"] * 0.50
                 or (
@@ -1073,88 +1246,138 @@ def shift_aware_boundary_pass(
             )
         )
 
-    return bool(base_primary or base_structural)
+    return bool(
+        scale_evidence >= scale_floor * 0.70
+        and (base_primary or base_structural)
+    )
+
+
+def state_runs(state_path: np.ndarray) -> list[tuple[int, int, int]]:
+    """状態列を (開始index, 終了index, キー) の連続区間へまとめる。"""
+    path = np.asarray(state_path, dtype=int)
+
+    if path.size == 0:
+        return []
+
+    runs: list[tuple[int, int, int]] = []
+    run_start = 0
+    run_state = int(path[0])
+
+    for index in range(1, len(path)):
+        current_state = int(path[index])
+        if current_state != run_state:
+            runs.append((run_start, index - 1, run_state))
+            run_start = index
+            run_state = current_state
+
+    runs.append((run_start, len(path) - 1, run_state))
+    return runs
 
 
 def suppress_fifth_round_trips(
-    boundaries: list[dict[str, Any]],
+    state_path: np.ndarray,
     segment_results: list[dict[str, Any]],
-    sensitivity: str,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    candidate_boundaries: list[dict[str, Any]],
+) -> np.ndarray:
     """
-    -5半音の後に+5半音など、5度方向へ移動して元へ戻る組を検出する。
-    根拠が非常に強い場合を除き、機能和声・コード進行による疑似転調として抑制する。
+    -5半音の後に+5半音など、5度方向へ移動して元へ戻る往復を打ち消す。
+
+    Ⅳ・Ⅴを強調するサビや二次ドミナントの多い進行は、区間単位で見ると
+    属調・下属調へ移ったように見え、次の区間で必ず元へ戻る。
+    根拠が非常に強い場合を除き、機能和声による疑似転調として吸収する。
     """
-    if len(boundaries) < 2:
-        return list(boundaries), []
+    path = np.asarray(state_path, dtype=int).copy()
 
-    remove_indices: set[int] = set()
-    suppressed: list[dict[str, Any]] = []
+    for _ in range(4):
+        runs = state_runs(path)
 
-    for index in range(len(boundaries) - 1):
-        first = boundaries[index]
-        second = boundaries[index + 1]
+        if len(runs) < 3:
+            break
 
-        first_shift = int(first.get("shift", 0)) % 12
-        second_shift = int(second.get("shift", 0)) % 12
+        collapsed = False
 
-        is_inverse_fifth_pair = (
-            first_shift in FIFTH_SHIFTS
-            and second_shift in FIFTH_SHIFTS
-            and (first_shift + second_shift) % 12 == 0
-        )
+        for run_index in range(1, len(runs) - 1):
+            previous_state = runs[run_index - 1][2]
+            current_state = runs[run_index][2]
+            next_state = runs[run_index + 1][2]
 
-        if not is_inverse_fifth_pair:
-            continue
+            if previous_state != next_state or current_state == previous_state:
+                continue
 
-        middle_segment = (
-            segment_results[index + 1]
-            if index + 1 < len(segment_results)
-            else None
-        )
-        middle_confidence = (
-            float(middle_segment["absolute_confidence"])
-            if middle_segment is not None
-            else 0.0
-        )
+            shift = (
+                KEY_LABELS[current_state][0]
+                - KEY_LABELS[previous_state][0]
+            ) % 12
 
-        first_quality = boundary_confidence(first)
-        second_quality = boundary_confidence(second)
-        first_consensus = float(first.get("consensus", 0.0))
-        second_consensus = float(second.get("consensus", 0.0))
-        first_structure = float(
-            first.get("structural_strength", 0.0)
-        )
-        second_structure = float(
-            second.get("structural_strength", 0.0)
-        )
+            if shift not in FIFTH_SHIFTS:
+                continue
 
-        both_direct_routes = (
-            first.get("detection_route") == "移調量"
-            and second.get("detection_route") == "移調量"
-        )
+            enter_index = runs[run_index][0] - 1
+            leave_index = runs[run_index + 1][0] - 1
 
-        # 本当に「転調して元へ戻った」とみなすには、
-        # 両境界と中間区間のすべてにかなり強い証拠を要求する。
-        exceptionally_strong = (
-            min(first_quality, second_quality) >= 91.0
-            and min(first_consensus, second_consensus) >= 0.74
-            and min(first_structure, second_structure) >= 0.54
-            and middle_confidence >= 72.0
-            and both_direct_routes
-        )
+            if not (
+                0 <= enter_index < len(candidate_boundaries)
+                and 0 <= leave_index < len(candidate_boundaries)
+            ):
+                continue
 
-        if not exceptionally_strong:
-            remove_indices.update({index, index + 1})
-            suppressed.extend([first, second])
+            first = candidate_boundaries[enter_index]
+            second = candidate_boundaries[leave_index]
 
-    kept = [
-        boundary
-        for index, boundary in enumerate(boundaries)
-        if index not in remove_indices
-    ]
+            middle = segment_results[
+                runs[run_index][0]:runs[run_index][1] + 1
+            ]
+            middle_confidence = (
+                min(
+                    float(segment["absolute_confidence"])
+                    for segment in middle
+                )
+                if middle
+                else 0.0
+            )
+            middle_duration = sum(
+                float(segment["duration"]) for segment in middle
+            )
 
-    return kept, suppressed
+            qualities = (
+                boundary_confidence(first),
+                boundary_confidence(second),
+            )
+            consensuses = (
+                float(first.get("consensus", 0.0)),
+                float(second.get("consensus", 0.0)),
+            )
+            structures = (
+                float(first.get("structural_strength", 0.0)),
+                float(second.get("structural_strength", 0.0)),
+            )
+            scale_evidences = (
+                float(first.get("scale_change_evidence", 0.0)),
+                float(second.get("scale_change_evidence", 0.0)),
+            )
+
+            # 本当に「転調して元へ戻った」とみなすには、両境界と
+            # 中間区間のすべてにかなり強い証拠を要求する。
+            exceptionally_strong = (
+                min(qualities) >= 88.0
+                and min(consensuses) >= 0.70
+                and min(structures) >= 0.50
+                and min(scale_evidences) >= 0.045
+                and middle_confidence >= 68.0
+                and middle_duration >= 24.0
+            )
+
+            if not exceptionally_strong:
+                path[runs[run_index][0]:runs[run_index][1] + 1] = (
+                    previous_state
+                )
+                collapsed = True
+                break
+
+        if not collapsed:
+            break
+
+    return path
 
 
 
@@ -1214,103 +1437,6 @@ def segment_key_analysis(
         "absolute_second": int(ranking[1]),
         "absolute_confidence": key_confidence(scores),
     }
-
-
-def choose_chained_segment_keys(
-    segment_results: list[dict[str, Any]],
-    boundaries: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    if not segment_results:
-        return []
-
-    final_results: list[dict[str, Any]] = []
-    first = dict(segment_results[0])
-    first["final_key"] = int(first["absolute_key"])
-    first["method"] = "区間を直接判定"
-    first["shift_from_previous"] = None
-    first["shift_support"] = None
-    final_results.append(first)
-
-    for index in range(1, len(segment_results)):
-        current = dict(segment_results[index])
-        previous = final_results[index - 1]
-        boundary = boundaries[index - 1]
-
-        shift = int(boundary["shift"])
-        shifted_same_mode = transpose_key(
-            previous["final_key"],
-            shift,
-        )
-        shifted_relative = relative_key_index(shifted_same_mode)
-
-        # 原則として転調前と同じメジャー/マイナーを維持する。
-        # 相対調側が明確に強い場合だけモード変更を許可する。
-        same_mode_score = float(
-            current["scores"][shifted_same_mode]
-        )
-        relative_mode_score = float(
-            current["scores"][shifted_relative]
-        )
-
-        if (
-            relative_mode_score - same_mode_score >= 0.085
-            and current["absolute_confidence"] >= 58.0
-        ):
-            shifted_candidate = shifted_relative
-        else:
-            shifted_candidate = shifted_same_mode
-
-        absolute_candidate = int(current["absolute_key"])
-        shifted_score = float(current["scores"][shifted_candidate])
-        absolute_score = float(current["scores"][absolute_candidate])
-        score_gap = absolute_score - shifted_score
-
-        shift_support = float(
-            boundary.get(
-                "best_nonzero_alignment",
-                boundary.get("best_nonzero_similarity", 0.0),
-            )
-        )
-        hybrid_gain = float(
-            boundary.get(
-                "hybrid_gain",
-                boundary.get("gain", 0.0),
-            )
-        )
-        structural_strength = float(
-            boundary.get("structural_strength", 0.0)
-        )
-
-        if (
-            shift_support >= 0.62
-            and structural_strength >= 0.28
-            and score_gap <= 0.16
-        ):
-            final_key = shifted_candidate
-            method = (
-                f"前区間の同系統から{format_shift(shift)}"
-            )
-        elif (
-            hybrid_gain >= 0.006
-            and score_gap <= 0.090
-        ):
-            final_key = shifted_candidate
-            method = (
-                f"移調量を優先（{format_shift(shift)}）"
-            )
-        else:
-            final_key = absolute_candidate
-            method = "区間を直接判定"
-
-        current["final_key"] = int(final_key)
-        current["method"] = method
-        current["shift_from_previous"] = shift
-        current["shift_support"] = shift_support
-        current["shift_score_gap"] = float(score_gap)
-        final_results.append(current)
-
-    return final_results
-
 
 
 def _mode_relation_score(previous_key: int, current_key: int, shift: int) -> float:
@@ -1386,6 +1512,12 @@ def optimize_segment_key_sequence(
             boundary.get("combined_alignment", np.zeros(12)),
             dtype=np.float64,
         )
+        scale_support = np.asarray(
+            boundary.get("scale_support", np.zeros(12)),
+            dtype=np.float64,
+        )
+        if scale_support.size != 12:
+            scale_support = np.zeros(12, dtype=np.float64)
 
         transition_matrix = np.full(
             (n_states, n_states),
@@ -1398,10 +1530,11 @@ def optimize_segment_key_sequence(
 
             for current_key in range(n_states):
                 if current_key == previous_key:
-                    # 弱い候補では同じキーを維持し、強い候補では維持を少し不利にする。
+                    # キー維持を基準点(0)に置く。候補が弱いほど維持を優遇し、
+                    # 強い候補でも維持そのものを不利にはしない。
+                    # 転調側は下の加点で基準点を超えたときだけ選ばれる。
                     transition_matrix[previous_key, current_key] = (
-                        0.22 * (1.0 - quality)
-                        - 0.62 * quality * max(structural, 0.15)
+                        0.30 * (1.0 - quality)
                     )
                     continue
 
@@ -1414,23 +1547,33 @@ def optimize_segment_key_sequence(
                     0.0,
                     1.0,
                 )
-                expected_bonus = 0.56 if shift == expected_shift else 0.0
+                expected_bonus = 0.45 if shift == expected_shift else 0.0
                 mode_score = _mode_relation_score(
                     previous_key,
                     current_key,
                     shift,
                 )
 
+                # 調号が実際に動いた証拠。負なら「構成音は変わっていない」
+                # ということなので、そのまま減点として効く。
+                scale_score = float(np.clip(scale_support[shift], -1.0, 1.0))
+
                 fifth_penalty = 0.0
-                if shift in FIFTH_SHIFTS and quality < 0.84:
-                    fifth_penalty = 0.25 + 0.20 * (0.84 - quality)
+                if shift in FIFTH_SHIFTS:
+                    # 属調・下属調は進行の重心移動でも出る。
+                    # 構成音の入れ替わりが弱いほど強く抑える。
+                    fifth_penalty = (
+                        0.60 * (1.0 - np.clip(scale_score, 0.0, 1.0))
+                        + 0.20 * (1.0 - quality)
+                    )
 
                 transition_matrix[previous_key, current_key] = (
                     -base_penalty
-                    + 1.42 * quality * alignment_support
+                    + 1.15 * quality * alignment_support
                     + expected_bonus * quality
-                    + 0.48 * structural
-                    + 0.18 * consensus
+                    + 0.35 * structural * quality
+                    + 0.15 * consensus
+                    + 0.55 * scale_score
                     + mode_score
                     - fifth_penalty
                 )
@@ -1471,13 +1614,22 @@ def stabilize_short_state_excursions(
             continue
 
         segment = segment_results[index]
-        left_quality = boundary_confidence(candidate_boundaries[index - 1])
-        right_quality = boundary_confidence(candidate_boundaries[index])
+        left = candidate_boundaries[index - 1]
+        right = candidate_boundaries[index]
+        left_quality = boundary_confidence(left)
+        right_quality = boundary_confidence(right)
+        weakest_scale = min(
+            float(left.get("scale_change_evidence", 0.0)),
+            float(right.get("scale_change_evidence", 0.0)),
+        )
 
         weak_excursion = (
             segment["duration"] < threshold
-            and segment["absolute_confidence"] < 48.0
-            and min(left_quality, right_quality) < 58.0
+            and (
+                segment["absolute_confidence"] < 62.0
+                or weakest_scale < float(settings["minimum_scale_change"])
+            )
+            and min(left_quality, right_quality) < 70.0
         )
 
         if weak_excursion:
@@ -1502,18 +1654,7 @@ def merge_optimized_state_runs(
     if not segment_results:
         return [], [], []
 
-    runs: list[tuple[int, int, int]] = []
-    run_start = 0
-    run_state = int(state_path[0])
-
-    for index in range(1, len(state_path)):
-        current_state = int(state_path[index])
-        if current_state != run_state:
-            runs.append((run_start, index - 1, run_state))
-            run_start = index
-            run_state = current_state
-
-    runs.append((run_start, len(state_path) - 1, run_state))
+    runs = state_runs(state_path)
 
     merged_segments: list[dict[str, Any]] = []
     accepted_boundaries: list[dict[str, Any]] = []
@@ -1585,7 +1726,21 @@ def aggregate_main_key(
             + float(segment["duration"])
         )
 
-    main_key = max(duration_by_key, key=duration_by_key.get)
+    # 滞在時間が最長のキーを主調にする。ただし転調が曲のちょうど
+    # 真ん中で起きた場合など僅差になることがあるので、その場合は
+    # 曲が始まったキーをホームキーとみなす。
+    start_key = int(segments[0]["final_key"])
+    longest_duration = max(duration_by_key.values())
+
+    def main_key_rank(key_index: int) -> tuple[bool, bool, float]:
+        duration = duration_by_key[key_index]
+        return (
+            duration >= longest_duration * 0.85,
+            key_index == start_key,
+            duration,
+        )
+
+    main_key = max(duration_by_key, key=main_key_rank)
     total_duration = sum(duration_by_key.values())
     main_duration = duration_by_key[main_key]
 
@@ -1725,17 +1880,24 @@ def analyze_audio_file(
 
     tuning_audio = harmonic[: min(len(harmonic), sr * 180)]
     try:
-        tuning = float(
+        # 半音単位で推定する。36分割のまま推定すると補正範囲が
+        # ±1/3半音（約±16.7セント）に制限され、A=432Hz録音や
+        # テープ速度のずれた音源で音名が隣へ滑ってしまう。
+        tuning_semitones = float(
             librosa.estimate_tuning(
                 y=tuning_audio,
                 sr=sr,
-                bins_per_octave=BINS_PER_OCTAVE,
-                resolution=0.01,
+                bins_per_octave=12,
+                resolution=0.005,
             )
         )
-        tuning = float(np.clip(tuning, -0.5, 0.5))
+        tuning_semitones = float(np.clip(tuning_semitones, -0.5, 0.5))
     except Exception:
-        tuning = 0.0
+        tuning_semitones = 0.0
+
+    # librosa.cqtのtuningは「そのCQTのビン幅」を単位に取るため、
+    # 半音単位の推定値をビン単位へ変換して渡す。
+    tuning = tuning_semitones * (BINS_PER_OCTAVE / 12.0)
 
     safe_progress(progress_callback, 0.23, "全音域と低音域の特徴を計算中…")
     cqt = np.abs(
@@ -1781,11 +1943,17 @@ def analyze_audio_file(
 
     # C1〜B3の3オクターブを低音特徴として集計
     bass_bin_count = 3 * BINS_PER_OCTAVE
+    bins_per_semitone = BINS_PER_OCTAVE // 12
     bass_cqt = compressed_cqt[:bass_bin_count, :frame_count]
+
+    # ビン0がC1のちょうど中心なので、素直に3本ずつ束ねると
+    # 各音名が「中心＋上寄り2本」になり、上隣の音名の裾を吸い込む。
+    # 半音の中心を挟むように1本ずらしてから束ねる。
+    bass_cqt = np.roll(bass_cqt, bins_per_semitone // 2, axis=0)
     bass_chroma = bass_cqt.reshape(
         3,
         12,
-        BINS_PER_OCTAVE // 12,
+        bins_per_semitone,
         frame_count,
     ).sum(axis=(0, 2))
     bass_chroma /= np.sum(bass_chroma, axis=0, keepdims=True) + 1e-12
@@ -1828,12 +1996,31 @@ def analyze_audio_file(
     )
 
     # 候補はやや広めに残し、全区間の状態追跡で採否を決める。
+    # ただし信頼度だけの抜け道は作らない。以前はここで
+    # boundary_confidence >= 38 を通していたため、shift_aware_boundary_pass
+    # の5度方向チェックが実質無効になり、Ⅳ・Ⅴを強調する進行が
+    # そのまま転調候補として通過していた。
+    minimum_scale_change = float(settings["minimum_scale_change"])
+
+    def confidence_fallback(boundary: dict[str, Any]) -> bool:
+        if boundary_confidence(boundary) < 52.0:
+            return False
+
+        scale_evidence = float(
+            boundary.get("scale_change_evidence", 0.0)
+        )
+
+        if int(boundary.get("shift", 0)) % 12 in FIFTH_SHIFTS:
+            return scale_evidence >= minimum_scale_change * 1.3
+
+        return scale_evidence >= minimum_scale_change * 0.5
+
     candidate_boundaries = [
         boundary
         for boundary in refined_boundaries
         if (
             shift_aware_boundary_pass(boundary, settings)
-            or boundary_confidence(boundary) >= 38.0
+            or confidence_fallback(boundary)
         )
     ]
 
@@ -1862,6 +2049,11 @@ def analyze_audio_file(
         segment_results,
         candidate_boundaries,
         settings,
+    )
+    state_path = suppress_fifth_round_trips(
+        state_path,
+        segment_results,
+        candidate_boundaries,
     )
 
     final_segments, boundaries, suppressed_boundaries = (
@@ -1976,6 +2168,11 @@ def analyze_audio_file(
 各区間のキーらしさと境界の移調量を同時に評価するため、
 `元キー → 落ちサビのキー → 元キー`の復帰や、複数回の転調を追跡できます。
 
+転調の判定には**調号そのものが動いたか**を必ず確認しています。
+たとえばC MajorからG Majorへ本当に転調していればF♯が現れてFが減りますが、
+サビでⅣ・Ⅴを強調しているだけの進行では構成音は変わりません。
+この差を見ることで、コード進行の重心移動を転調と誤認しにくくしています。
+
 ### 相対調の判別
 
 {relative_note}
@@ -2032,6 +2229,10 @@ def analyze_audio_file(
                     ),
                     1,
                 ),
+                "調号の変化": round(
+                    100.0 * boundary.get("scale_change_evidence", 0.0),
+                    1,
+                ),
                 "種類": boundary.get(
                     "transition_type",
                     "新しい転調",
@@ -2051,6 +2252,7 @@ def analyze_audio_file(
             "位置信頼度",
             "移調一致度",
             "0半音との差",
+            "調号の変化",
             "種類",
             "検出経路",
         ],
@@ -2091,7 +2293,7 @@ def analyze_audio_file(
         "転調の可能性": modulation_label,
         "転調信頼度": round(modulation_confidence, 1),
         "検出転調数": len(boundaries),
-        "チューニング補正値": round(tuning, 4),
+        "チューニング補正値（セント）": round(tuning_semitones * 100.0, 1),
         "転調候補走査数": len(raw_candidates),
         "採用した境界数": len(boundaries),
         "キーへの復帰回数": return_count,
