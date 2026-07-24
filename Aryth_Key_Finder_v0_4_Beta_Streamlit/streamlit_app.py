@@ -5,6 +5,7 @@ import hashlib
 import os
 import tempfile
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -251,6 +252,35 @@ def analyze_uploaded_audio(
                 pass
 
         gc.collect()
+
+
+def describe_failure(error: Exception) -> str:
+    """
+    失敗の理由を日本語で説明する。
+
+    MemoryErrorのように、そのまま文字列化すると空になる例外がある。
+    以前は「原因：」の後ろが空欄になり、何も分からなかった。
+    """
+    if isinstance(error, MemoryError):
+        return (
+            "**メモリが足りませんでした。**\n\n"
+            "曲が長いか、サーバーが混み合っています。次を試してください。\n\n"
+            "- しばらく待ってからもう一度実行する\n"
+            "- 短い曲、または曲の一部を切り出して試す\n"
+            "- ブラウザを再読み込みしてから実行する"
+        )
+
+    message = str(error).strip()
+
+    if message:
+        return f"解析できませんでした。\n\n**原因：** {message}"
+
+    return (
+        "解析できませんでした。\n\n"
+        f"**原因：** {type(error).__name__}"
+        "（詳細なメッセージがありません）\n\n"
+        "下の「技術的な詳細」を開くと、発生箇所が分かります。"
+    )
 
 
 def render_empty_state() -> None:
@@ -532,10 +562,18 @@ if submitted:
                 except Exception as error:
                     st.session_state.analysis_result = None
                     st.session_state.analysis_signature = None
-                    st.error(
-                        "解析できませんでした。\n\n"
-                        f"**原因：** {error}"
-                    )
+                    st.error(describe_failure(error))
+                    with st.expander("技術的な詳細"):
+                        st.code(
+                            "".join(
+                                traceback.format_exception(
+                                    type(error),
+                                    error,
+                                    error.__traceback__,
+                                )
+                            ),
+                            language="text",
+                        )
 
 st.header("解析結果")
 render_results()
