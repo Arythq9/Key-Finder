@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import math
 from pathlib import Path
 from typing import Any, Callable
@@ -25,6 +26,17 @@ BINS_PER_OCTAVE = 36
 N_OCTAVES = 7
 MAX_DURATION_SECONDS = 20 * 60
 MIN_AUDIO_SECONDS = 12.0
+
+# 特徴量はブロックごとに計算する。
+# 打楽器成分の抑制（HPSS）は曲の長さに比例してメモリを食い、
+# 6分の曲で1GB近くに達する。クロマ自体は1分あたり0.03MBしかないので、
+# 短い区間へ切って計算し、クロマだけを残せばメモリは曲の長さに依存しなくなる。
+BLOCK_SECONDS = 60.0
+
+# ブロック境界での歪みを避けるための前後ののりしろ。
+# C1付近のCQT窓が約1.6秒、CENSの平滑化が約2秒必要なので、
+# それらを十分に上回る長さを取る。
+BLOCK_PAD_SECONDS = 4.0
 
 CHANGE_SCAN_STEP_SECONDS = 2.0
 CHANGE_CONTEXT_OPTIONS = (12.0, 18.0, 24.0)
@@ -1828,6 +1840,231 @@ def boundary_confidence(boundary: dict[str, Any]) -> float:
     return float(np.clip(value, 0.0, 100.0))
 
 
+def trim_silence(y: np.ndarray, top_db: float = 42.0) -> np.ndarray:
+    """
+    前後の無音を削る。
+
+    librosa.effects.trimは信号を重ねてフレーム化するため、
+    20分の曲では一時的に200MB以上を使う。ここでは重なりなしの
+    フレームに対してeinsumで二乗和を求めるので、
+    大きな一時配列を作らずに済む。
+    """
+    hop = HOP_LENGTH
+    frame_count = len(y) // hop
+
+    if frame_count < 2:
+        return y
+
+    frames = y[: frame_count * hop].reshape(frame_count, hop)
+
+    # einsumは二乗した配列を作らずに行ごとの二乗和を出す。
+    energy = np.sqrt(
+        np.einsum("ij,ij->i", frames, frames, dtype=np.float64) / hop
+    )
+    peak = float(energy.max())
+
+    if peak <= 0.0:
+        return y
+
+    threshold = peak * (10.0 ** (-float(top_db) / 20.0))
+    loud = np.flatnonzero(energy > threshold)
+
+    if loud.size == 0:
+        return y
+
+    start = int(loud[0]) * hop
+    end = min(len(y), (int(loud[-1]) + 1) * hop)
+
+    return y[start:end]
+
+
+def estimate_tuning_semitones(harmonic: np.ndarray, sr: int) -> float:
+    """
+    チューニングのずれを半音単位で推定する。
+
+    36分割のまま推定すると補正範囲が±1/3半音（約±16.7セント）に
+    制限され、A=432Hz録音やテープ速度のずれた音源で音名が隣へ滑る。
+    """
+    try:
+        value = float(
+            librosa.estimate_tuning(
+                y=harmonic,
+                sr=sr,
+                bins_per_octave=12,
+                resolution=0.005,
+            )
+        )
+        return float(np.clip(value, -0.5, 0.5))
+    except Exception:
+        return 0.0
+
+
+def block_features(
+    harmonic: np.ndarray,
+    sr: int,
+    tuning: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """1ブロック分の全音域クロマ・低音域クロマ・音量を計算する。"""
+    cqt = np.abs(
+        librosa.cqt(
+            harmonic,
+            sr=sr,
+            hop_length=HOP_LENGTH,
+            fmin=librosa.note_to_hz("C1"),
+            n_bins=BINS_PER_OCTAVE * N_OCTAVES,
+            bins_per_octave=BINS_PER_OCTAVE,
+            tuning=tuning,
+        )
+    )
+    compressed_cqt = np.log1p(8.0 * cqt)
+    del cqt
+
+    chroma_cqt = librosa.feature.chroma_cqt(
+        C=compressed_cqt,
+        sr=sr,
+        hop_length=HOP_LENGTH,
+        n_chroma=12,
+        n_octaves=N_OCTAVES,
+        bins_per_octave=BINS_PER_OCTAVE,
+        tuning=tuning,
+    )
+    chroma_cens = librosa.feature.chroma_cens(
+        C=compressed_cqt,
+        sr=sr,
+        hop_length=HOP_LENGTH,
+        n_chroma=12,
+        n_octaves=N_OCTAVES,
+        bins_per_octave=BINS_PER_OCTAVE,
+        tuning=tuning,
+        win_len_smooth=21,
+    )
+
+    frame_count = min(chroma_cqt.shape[1], chroma_cens.shape[1])
+    full_chroma = (
+        0.72 * chroma_cqt[:, :frame_count]
+        + 0.28 * chroma_cens[:, :frame_count]
+    )
+
+    # C1〜B3の3オクターブを低音特徴として集計。
+    # ビン0がC1のちょうど中心なので、素直に3本ずつ束ねると
+    # 各音名が「中心＋上寄り2本」になり、上隣の音名の裾を吸い込む。
+    # 半音の中心を挟むように1本ずらしてから束ねる。
+    bins_per_semitone = BINS_PER_OCTAVE // 12
+    bass_cqt = compressed_cqt[: 3 * BINS_PER_OCTAVE, :frame_count]
+    bass_cqt = np.roll(bass_cqt, bins_per_semitone // 2, axis=0)
+    bass_chroma = bass_cqt.reshape(
+        3,
+        12,
+        bins_per_semitone,
+        frame_count,
+    ).sum(axis=(0, 2))
+
+    block_rms = librosa.feature.rms(
+        y=harmonic,
+        frame_length=4096,
+        hop_length=HOP_LENGTH,
+    )[0, :frame_count]
+
+    return full_chroma, bass_chroma, block_rms
+
+
+def extract_features(
+    y: np.ndarray,
+    sr: int,
+    progress_callback: Callable | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """
+    音声をブロックへ区切りながら特徴量を組み立てる。
+
+    HPSSとCQTはブロック内で完結させ、外へ持ち出すのはクロマと音量だけ。
+    こうすると必要なメモリが曲の長さでほぼ変わらなくなる。
+    ブロック境界の歪みを避けるため前後にのりしろを付けて計算し、
+    採用するのは中央部分だけにする。
+    """
+    n_samples = len(y)
+    total_frames = 1 + n_samples // HOP_LENGTH
+
+    block_samples = int(round(BLOCK_SECONDS * sr / HOP_LENGTH)) * HOP_LENGTH
+    pad_samples = int(round(BLOCK_PAD_SECONDS * sr / HOP_LENGTH)) * HOP_LENGTH
+
+    full_chroma = np.zeros((12, total_frames), dtype=np.float64)
+    bass_chroma = np.zeros((12, total_frames), dtype=np.float64)
+    rms = np.zeros(total_frames, dtype=np.float64)
+
+    tuning_semitones: float | None = None
+    filled_any = False
+    block_count = max(1, math.ceil(n_samples / block_samples))
+
+    for block_index, start in enumerate(
+        range(0, n_samples, block_samples)
+    ):
+        safe_progress(
+            progress_callback,
+            0.14 + 0.22 * (block_index / block_count),
+            f"特徴量を計算中…（{block_index + 1}/{block_count}）",
+        )
+
+        low = max(0, start - pad_samples)
+        high = min(n_samples, start + block_samples + pad_samples)
+        segment = y[low:high]
+
+        if len(segment) < HOP_LENGTH * 4:
+            continue
+
+        harmonic = librosa.effects.harmonic(segment, margin=3.0)
+
+        if tuning_semitones is None:
+            tuning_semitones = estimate_tuning_semitones(harmonic, sr)
+
+        # librosa.cqtのtuningは「そのCQTのビン幅」を単位に取るため、
+        # 半音単位の推定値をビン単位へ変換して渡す。
+        block_full, block_bass, block_rms = block_features(
+            harmonic,
+            sr,
+            tuning_semitones * (BINS_PER_OCTAVE / 12.0),
+        )
+        del harmonic, segment
+
+        # ブロック内フレームkは絶対サンプル low + k * HOP_LENGTH に対応する。
+        offset_frame = low // HOP_LENGTH
+        take_start = start // HOP_LENGTH - offset_frame
+        available = block_full.shape[1] - take_start
+
+        if available <= 0:
+            continue
+
+        write_start = start // HOP_LENGTH
+        length = min(
+            available,
+            total_frames - write_start,
+            block_samples // HOP_LENGTH
+            if high < n_samples
+            else total_frames - write_start,
+        )
+
+        if length <= 0:
+            continue
+
+        full_chroma[:, write_start:write_start + length] = (
+            block_full[:, take_start:take_start + length]
+        )
+        bass_chroma[:, write_start:write_start + length] = (
+            block_bass[:, take_start:take_start + length]
+        )
+        rms[write_start:write_start + length] = (
+            block_rms[take_start:take_start + length]
+        )
+        filled_any = True
+
+    if not filled_any:
+        raise ValueError("和音・旋律成分を十分に検出できませんでした。")
+
+    full_chroma /= np.sum(full_chroma, axis=0, keepdims=True) + 1e-12
+    bass_chroma /= np.sum(bass_chroma, axis=0, keepdims=True) + 1e-12
+
+    return full_chroma, bass_chroma, rms, float(tuning_semitones or 0.0)
+
+
 def analyze_audio_file(
     audio_path: str | Path,
     sensitivity: str = "標準",
@@ -1866,103 +2103,26 @@ def analyze_audio_file(
         raise ValueError("音声を正常に読み込めませんでした。")
 
     y = np.nan_to_num(y, copy=False)
-    y, _ = librosa.effects.trim(y, top_db=42)
+
+    y = trim_silence(y, top_db=42.0)
     duration = len(y) / sr
 
     if duration < MIN_AUDIO_SECONDS:
         raise ValueError("無音部分を除くと音声が短すぎます。")
 
     safe_progress(progress_callback, 0.14, "打楽器成分を抑制中…")
-    harmonic = librosa.effects.harmonic(y, margin=3.0)
+    full_chroma, bass_chroma, rms, tuning_semitones = extract_features(
+        y,
+        sr,
+        progress_callback,
+    )
 
-    if not np.any(np.abs(harmonic) > 1e-8):
+    # 音声そのものはもう使わないので手放す。
+    del y
+    gc.collect()
+
+    if not np.any(rms > 1e-8):
         raise ValueError("和音・旋律成分を十分に検出できませんでした。")
-
-    tuning_audio = harmonic[: min(len(harmonic), sr * 180)]
-    try:
-        # 半音単位で推定する。36分割のまま推定すると補正範囲が
-        # ±1/3半音（約±16.7セント）に制限され、A=432Hz録音や
-        # テープ速度のずれた音源で音名が隣へ滑ってしまう。
-        tuning_semitones = float(
-            librosa.estimate_tuning(
-                y=tuning_audio,
-                sr=sr,
-                bins_per_octave=12,
-                resolution=0.005,
-            )
-        )
-        tuning_semitones = float(np.clip(tuning_semitones, -0.5, 0.5))
-    except Exception:
-        tuning_semitones = 0.0
-
-    # librosa.cqtのtuningは「そのCQTのビン幅」を単位に取るため、
-    # 半音単位の推定値をビン単位へ変換して渡す。
-    tuning = tuning_semitones * (BINS_PER_OCTAVE / 12.0)
-
-    safe_progress(progress_callback, 0.23, "全音域と低音域の特徴を計算中…")
-    cqt = np.abs(
-        librosa.cqt(
-            harmonic,
-            sr=sr,
-            hop_length=HOP_LENGTH,
-            fmin=librosa.note_to_hz("C1"),
-            n_bins=BINS_PER_OCTAVE * N_OCTAVES,
-            bins_per_octave=BINS_PER_OCTAVE,
-            tuning=tuning,
-        )
-    )
-
-    compressed_cqt = np.log1p(8.0 * cqt)
-
-    chroma_cqt = librosa.feature.chroma_cqt(
-        C=compressed_cqt,
-        sr=sr,
-        hop_length=HOP_LENGTH,
-        n_chroma=12,
-        n_octaves=N_OCTAVES,
-        bins_per_octave=BINS_PER_OCTAVE,
-        tuning=tuning,
-    )
-    chroma_cens = librosa.feature.chroma_cens(
-        C=compressed_cqt,
-        sr=sr,
-        hop_length=HOP_LENGTH,
-        n_chroma=12,
-        n_octaves=N_OCTAVES,
-        bins_per_octave=BINS_PER_OCTAVE,
-        tuning=tuning,
-        win_len_smooth=21,
-    )
-
-    frame_count = min(chroma_cqt.shape[1], chroma_cens.shape[1])
-    chroma_cqt = chroma_cqt[:, :frame_count]
-    chroma_cens = chroma_cens[:, :frame_count]
-
-    full_chroma = 0.72 * chroma_cqt + 0.28 * chroma_cens
-    full_chroma /= np.sum(full_chroma, axis=0, keepdims=True) + 1e-12
-
-    # C1〜B3の3オクターブを低音特徴として集計
-    bass_bin_count = 3 * BINS_PER_OCTAVE
-    bins_per_semitone = BINS_PER_OCTAVE // 12
-    bass_cqt = compressed_cqt[:bass_bin_count, :frame_count]
-
-    # ビン0がC1のちょうど中心なので、素直に3本ずつ束ねると
-    # 各音名が「中心＋上寄り2本」になり、上隣の音名の裾を吸い込む。
-    # 半音の中心を挟むように1本ずらしてから束ねる。
-    bass_cqt = np.roll(bass_cqt, bins_per_semitone // 2, axis=0)
-    bass_chroma = bass_cqt.reshape(
-        3,
-        12,
-        bins_per_semitone,
-        frame_count,
-    ).sum(axis=(0, 2))
-    bass_chroma /= np.sum(bass_chroma, axis=0, keepdims=True) + 1e-12
-
-    rms = librosa.feature.rms(
-        y=harmonic,
-        frame_length=4096,
-        hop_length=HOP_LENGTH,
-    )[0, :frame_count]
 
     safe_progress(progress_callback, 0.38, "半音移動をスキャン中…")
     raw_candidates = scan_change_candidates(
