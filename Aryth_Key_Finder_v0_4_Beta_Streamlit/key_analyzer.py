@@ -22,6 +22,13 @@ import pandas as pd
 
 SAMPLE_RATE = 22_050
 HOP_LENGTH = 2_048
+
+# テンポ推定用のオンセット包絡は細かい刻みが要る。
+# HOP_LENGTH(2048)だと1秒あたり約10.8フレームしか無く、
+# たとえば140や150 BPMを整数ラグで表現できずに桁が飛ぶ。
+# 512刻み（約43フレーム/秒）ならこの帯域も十分に分解できる。
+ONSET_HOP_LENGTH = 512
+
 BINS_PER_OCTAVE = 36
 N_OCTAVES = 7
 MAX_DURATION_SECONDS = 20 * 60
@@ -37,6 +44,28 @@ BLOCK_SECONDS = 60.0
 # C1付近のCQT窓が約1.6秒、CENSの平滑化が約2秒必要なので、
 # それらを十分に上回る長さを取る。
 BLOCK_PAD_SECONDS = 4.0
+
+# テンポ推定の設定。
+# 知覚的に自然なテンポ帯（Moelantsらのいう約120 BPM付近）を
+# 中心に置いた対数正規の重みで、倍/半のオクターブ誤差を選び分ける。
+TEMPO_MIN_BPM = 40.0
+TEMPO_MAX_BPM = 280.0
+TEMPO_PRIOR_CENTER = 125.0
+TEMPO_PRIOR_SIGMA = 0.9  # log2（オクターブ）単位
+
+# テンポ変化の検出設定。
+# 局所テンポを窓で追い、はっきりした変化が十分続いたときだけ区切る。
+# 誤検出を強く嫌う方針なので、区間は長め・変化幅は大きめを既定にする。
+TEMPO_WINDOW_SECONDS = 12.0
+TEMPO_STEP_SECONDS = 3.0
+MIN_TEMPO_SEGMENT_SECONDS = 20.0
+
+# 「テンポが変わった」とみなす最小の相対差（5%＝120→126程度）。
+TEMPO_CHANGE_RATIO = 0.05
+
+# 2:1（倍/半）の関係はテンポ検出の曖昧さで揺れやすく、
+# ハーフタイム／ダブルタイムは同じテンポの取り方違いとみなす。
+# そのため比較前にオクターブを揃え、純粋な倍/半は変化として扱わない。
 
 CHANGE_SCAN_STEP_SECONDS = 2.0
 CHANGE_CONTEXT_OPTIONS = (12.0, 18.0, 24.0)
@@ -243,6 +272,30 @@ def format_shift(semitones: int) -> str:
 
     signed = semitones if semitones <= 6 else semitones - 12
     return f"{signed:+d}半音"
+
+
+def format_bpm(tempo: dict[str, float]) -> str:
+    """テンポ推定を人間向けの文字列にする。倍/半の候補も併記する。"""
+    bpm = float(tempo.get("bpm", 0.0))
+
+    if bpm <= 0.0:
+        return "拍が弱く推定できませんでした"
+
+    text = f"{bpm:.0f} BPM"
+
+    alt = float(tempo.get("alt_bpm", 0.0))
+    if alt > 0.0:
+        text += f"（倍/半の候補: {alt:.0f} BPM）"
+
+    return text
+
+
+def bpm_confidence_label(confidence: float) -> str:
+    if confidence >= 0.55:
+        return "高め"
+    if confidence >= 0.30:
+        return "中程度"
+    return "低め（倍/半の候補も検討してください）"
 
 
 def safe_progress(
@@ -1899,6 +1952,296 @@ def estimate_tuning_semitones(harmonic: np.ndarray, sr: int) -> float:
         return 0.0
 
 
+def place_block_feature(
+    destination: np.ndarray,
+    block_feature: np.ndarray,
+    low: int,
+    start: int,
+    hop: int,
+    block_samples: int,
+    reaches_end: bool,
+) -> bool:
+    """
+    のりしろ付きで計算したブロックから、中央の採用部分だけを全体配列へ書く。
+
+    ブロック内フレームkは絶対サンプル low + k * hop に対応する。
+    末尾ブロック以外は block_samples 分だけ書き、前後ののりしろは捨てる。
+    1次元（音量・オンセット）と2次元（クロマ）の両方を扱う。
+    """
+    offset_frame = low // hop
+    take_start = start // hop - offset_frame
+    available = block_feature.shape[-1] - take_start
+
+    if available <= 0:
+        return False
+
+    write_start = start // hop
+    total = destination.shape[-1]
+
+    if reaches_end:
+        length = min(available, total - write_start)
+    else:
+        length = min(available, total - write_start, block_samples // hop)
+
+    if length <= 0:
+        return False
+
+    source = block_feature[..., take_start:take_start + length]
+    if destination.ndim == 1:
+        destination[write_start:write_start + length] = source
+    else:
+        destination[:, write_start:write_start + length] = source
+
+    return True
+
+
+def estimate_tempo(
+    onset_envelope: np.ndarray,
+    sr: int,
+    hop: int = ONSET_HOP_LENGTH,
+) -> dict[str, float]:
+    """
+    オンセット包絡の自己相関からテンポ（BPM）を推定する。
+
+    テンポ検出には、実テンポの2倍・半分を答えてしまう「オクターブ誤差」が
+    つきまとう。パルス列の自己相関は拍の位置だけでなくその整数倍のラグにも
+    山を作るため、自己相関の最大値をそのまま採ると遅い側へ寄りやすい。
+    そこで知覚的に自然なテンポ帯を中心にした重みを掛けて代表値を選び、
+    もう一方のオクターブ（倍/半）を必ず候補として併記する。
+
+    構成音の判別と違い、倍か半かは音の並びだけでは原理的に確定できない
+    （174 BPMのドラムンベースと87 BPMのヒップホップは同じ拍位置になりうる）。
+    そのため確定させず、候補と信頼度を添えて利用者に委ねる。
+    """
+    onset_envelope = np.asarray(onset_envelope, dtype=np.float64)
+    empty = {"bpm": 0.0, "alt_bpm": 0.0, "confidence": 0.0}
+
+    if onset_envelope.size < 8:
+        return empty
+
+    centered = onset_envelope - onset_envelope.mean()
+    if centered.std() < 1e-9:
+        return empty
+
+    autocorrelation = np.maximum(
+        librosa.autocorrelate(centered, max_size=len(centered)),
+        0.0,
+    )
+    lags = np.arange(1, len(autocorrelation))
+    bpms = 60.0 * sr / (hop * lags)
+
+    in_range = (bpms >= TEMPO_MIN_BPM) & (bpms <= TEMPO_MAX_BPM)
+    bpms = bpms[in_range]
+    strength = autocorrelation[1:][in_range]
+
+    if bpms.size == 0 or strength.max() <= 0.0:
+        return empty
+
+    strength = strength / strength.max()
+
+    # ラグは大きいほどBPMが小さいので、補間しやすいよう昇順へ並べ替える。
+    order = np.argsort(bpms)
+    bpms = bpms[order]
+    strength = strength[order]
+
+    def strength_at(bpm: float) -> float:
+        if bpm < bpms[0] or bpm > bpms[-1]:
+            return 0.0
+        return float(np.interp(bpm, bpms, strength))
+
+    def prior(bpm: float) -> float:
+        return float(
+            np.exp(
+                -0.5
+                * (np.log2(bpm / TEMPO_PRIOR_CENTER) / TEMPO_PRIOR_SIGMA) ** 2
+            )
+        )
+
+    raw_peak = float(bpms[np.argmax(strength)])
+    ratios = (1 / 3, 1 / 2, 2 / 3, 1.0, 3 / 2, 2.0, 3.0)
+    candidates = sorted(
+        {
+            round(raw_peak * ratio, 1)
+            for ratio in ratios
+            if TEMPO_MIN_BPM <= raw_peak * ratio <= TEMPO_MAX_BPM
+        }
+    )
+
+    scored = sorted(
+        ((bpm, strength_at(bpm) * prior(bpm)) for bpm in candidates),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+
+    primary = scored[0][0]
+
+    # 対抗馬は知覚中心の反対側のオクターブ。
+    # 遅めに出た代表値（例：88）は速い拍を半分に取った可能性が高いので倍を、
+    # 速めに出た代表値には半分を添える。
+    if primary <= TEMPO_PRIOR_CENTER:
+        alt = round(primary * 2.0, 1)
+    else:
+        alt = round(primary / 2.0, 1)
+    if not (TEMPO_MIN_BPM <= alt <= TEMPO_MAX_BPM):
+        alt = 0.0
+
+    confidence = 0.0
+    if len(scored) > 1 and scored[0][1] > 0.0:
+        confidence = 1.0 - scored[1][1] / scored[0][1]
+
+    return {
+        "bpm": float(primary),
+        "alt_bpm": float(alt),
+        "confidence": float(np.clip(confidence, 0.0, 1.0)),
+    }
+
+
+def fold_to_reference(bpm: float, reference: float) -> float:
+    """bpmを2倍/半分してreferenceに最も近いオクターブへ揃える。"""
+    if bpm <= 0.0 or reference <= 0.0:
+        return bpm
+
+    folded = bpm
+    while folded / reference >= 1.4:
+        folded /= 2.0
+    while folded / reference <= 0.72:
+        folded *= 2.0
+    return folded
+
+
+def tempo_curve(
+    onset_envelope: np.ndarray,
+    sr: int,
+    hop: int = ONSET_HOP_LENGTH,
+) -> list[dict[str, float]]:
+    """窓をずらしながら局所テンポを測り、時間対BPMの並びを返す。"""
+    onset_envelope = np.asarray(onset_envelope, dtype=np.float64)
+    frames_per_second = sr / hop
+    window_frames = int(round(TEMPO_WINDOW_SECONDS * frames_per_second))
+    step_frames = max(1, int(round(TEMPO_STEP_SECONDS * frames_per_second)))
+
+    if onset_envelope.size < window_frames:
+        return []
+
+    curve: list[dict[str, float]] = []
+    last_start = onset_envelope.size - window_frames
+
+    for start in range(0, last_start + 1, step_frames):
+        segment = onset_envelope[start:start + window_frames]
+        estimate = estimate_tempo(segment, sr, hop)
+
+        if estimate["bpm"] <= 0.0:
+            continue
+
+        center_frame = start + window_frames / 2.0
+        curve.append(
+            {
+                "time": center_frame / frames_per_second,
+                "bpm": estimate["bpm"],
+                "confidence": estimate["confidence"],
+            }
+        )
+
+    return curve
+
+
+def _median_smooth(values: list[float], radius: int = 1) -> list[float]:
+    smoothed: list[float] = []
+    for index in range(len(values)):
+        low = max(0, index - radius)
+        high = min(len(values), index + radius + 1)
+        smoothed.append(float(np.median(values[low:high])))
+    return smoothed
+
+
+def segment_tempo_changes(
+    onset_envelope: np.ndarray,
+    sr: int,
+    duration: float,
+    hop: int = ONSET_HOP_LENGTH,
+) -> list[dict[str, Any]]:
+    """
+    局所テンポの並びから、はっきり変わって十分続く境界だけを拾い、
+    テンポ区間の一覧を返す。純粋な倍/半の揺れは変化として扱わない。
+    """
+    curve = tempo_curve(onset_envelope, sr, hop)
+
+    if len(curve) < 3:
+        return []
+
+    times = [point["time"] for point in curve]
+    smoothed = _median_smooth([point["bpm"] for point in curve], radius=1)
+
+    # 何窓ぶん連続してズレたら「変化」とみなすか。
+    sustain_windows = max(
+        2,
+        int(round(MIN_TEMPO_SEGMENT_SECONDS / TEMPO_STEP_SECONDS)),
+    )
+
+    # 貪欲に区間を伸ばし、十分続く逸脱が来たら切る。
+    boundaries: list[int] = []  # curveのインデックス（新区間の開始）
+    segment_start = 0
+    reference = smoothed[0]
+    deviating_since: int | None = None
+
+    for index in range(1, len(smoothed)):
+        folded = fold_to_reference(smoothed[index], reference)
+        relative_gap = abs(folded - reference) / max(reference, 1e-9)
+
+        if relative_gap > TEMPO_CHANGE_RATIO:
+            if deviating_since is None:
+                deviating_since = index
+            sustained = index - deviating_since + 1
+
+            # 逸脱がひとまとまりに続き、なおかつ現区間・新区間とも
+            # 最小長を満たせるときだけ境界として確定する。
+            new_start = deviating_since
+            enough_before = (
+                times[new_start] - times[segment_start]
+                >= MIN_TEMPO_SEGMENT_SECONDS
+            )
+            enough_after = (
+                duration - times[new_start]
+                >= MIN_TEMPO_SEGMENT_SECONDS
+            )
+
+            if sustained >= sustain_windows and enough_before and enough_after:
+                boundaries.append(new_start)
+                segment_start = new_start
+                reference = float(np.median(smoothed[new_start:index + 1]))
+                deviating_since = None
+        else:
+            deviating_since = None
+            # 現区間の基準を緩やかに更新（新しい値へゆっくり寄せる）
+            reference = 0.7 * reference + 0.3 * folded
+
+    # 境界で区間の時間範囲を作り、各区間で改めてテンポを推定する。
+    cut_times = [0.0]
+    cut_times.extend(times[boundary] for boundary in boundaries)
+    cut_times.append(duration)
+
+    frames_per_second = sr / hop
+    segments: list[dict[str, Any]] = []
+
+    for index in range(len(cut_times) - 1):
+        start_seconds = cut_times[index]
+        end_seconds = cut_times[index + 1]
+        start_frame = int(round(start_seconds * frames_per_second))
+        end_frame = int(round(end_seconds * frames_per_second))
+        segment_envelope = onset_envelope[start_frame:end_frame]
+        estimate = estimate_tempo(segment_envelope, sr, hop)
+        segments.append(
+            {
+                "start": float(start_seconds),
+                "end": float(end_seconds),
+                "duration": float(end_seconds - start_seconds),
+                **estimate,
+            }
+        )
+
+    return segments
+
+
 def block_features(
     harmonic: np.ndarray,
     sr: int,
@@ -1972,17 +2315,21 @@ def extract_features(
     y: np.ndarray,
     sr: int,
     progress_callback: Callable | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
     """
     音声をブロックへ区切りながら特徴量を組み立てる。
 
-    HPSSとCQTはブロック内で完結させ、外へ持ち出すのはクロマと音量だけ。
-    こうすると必要なメモリが曲の長さでほぼ変わらなくなる。
+    HPSSとCQTはブロック内で完結させ、外へ持ち出すのはクロマ・音量・
+    オンセット包絡だけ。こうすると必要なメモリが曲の長さでほぼ変わらない。
     ブロック境界の歪みを避けるため前後にのりしろを付けて計算し、
     採用するのは中央部分だけにする。
+
+    クロマ・音量はHOP_LENGTH刻み、テンポ用のオンセット包絡は
+    ONSET_HOP_LENGTH刻みで、それぞれ別の全体配列へ貼り合わせる。
     """
     n_samples = len(y)
     total_frames = 1 + n_samples // HOP_LENGTH
+    total_onset_frames = 1 + n_samples // ONSET_HOP_LENGTH
 
     block_samples = int(round(BLOCK_SECONDS * sr / HOP_LENGTH)) * HOP_LENGTH
     pad_samples = int(round(BLOCK_PAD_SECONDS * sr / HOP_LENGTH)) * HOP_LENGTH
@@ -1990,6 +2337,7 @@ def extract_features(
     full_chroma = np.zeros((12, total_frames), dtype=np.float64)
     bass_chroma = np.zeros((12, total_frames), dtype=np.float64)
     rms = np.zeros(total_frames, dtype=np.float64)
+    onset_envelope = np.zeros(total_onset_frames, dtype=np.float64)
 
     tuning_semitones: float | None = None
     filled_any = False
@@ -2011,6 +2359,15 @@ def extract_features(
         if len(segment) < HOP_LENGTH * 4:
             continue
 
+        reaches_end = high >= n_samples
+
+        # オンセット包絡は打楽器を含む生の信号から取る（HPSS前）。
+        block_onset = librosa.onset.onset_strength(
+            y=segment,
+            sr=sr,
+            hop_length=ONSET_HOP_LENGTH,
+        )
+
         harmonic = librosa.effects.harmonic(segment, margin=3.0)
 
         if tuning_semitones is None:
@@ -2025,36 +2382,23 @@ def extract_features(
         )
         del harmonic, segment
 
-        # ブロック内フレームkは絶対サンプル low + k * HOP_LENGTH に対応する。
-        offset_frame = low // HOP_LENGTH
-        take_start = start // HOP_LENGTH - offset_frame
-        available = block_full.shape[1] - take_start
-
-        if available <= 0:
-            continue
-
-        write_start = start // HOP_LENGTH
-        length = min(
-            available,
-            total_frames - write_start,
-            block_samples // HOP_LENGTH
-            if high < n_samples
-            else total_frames - write_start,
+        placed = place_block_feature(
+            full_chroma, block_full, low, start,
+            HOP_LENGTH, block_samples, reaches_end,
         )
-
-        if length <= 0:
-            continue
-
-        full_chroma[:, write_start:write_start + length] = (
-            block_full[:, take_start:take_start + length]
+        place_block_feature(
+            bass_chroma, block_bass, low, start,
+            HOP_LENGTH, block_samples, reaches_end,
         )
-        bass_chroma[:, write_start:write_start + length] = (
-            block_bass[:, take_start:take_start + length]
+        place_block_feature(
+            rms, block_rms, low, start,
+            HOP_LENGTH, block_samples, reaches_end,
         )
-        rms[write_start:write_start + length] = (
-            block_rms[take_start:take_start + length]
+        place_block_feature(
+            onset_envelope, block_onset, low, start,
+            ONSET_HOP_LENGTH, block_samples, reaches_end,
         )
-        filled_any = True
+        filled_any = filled_any or placed
 
     if not filled_any:
         raise ValueError("和音・旋律成分を十分に検出できませんでした。")
@@ -2062,7 +2406,13 @@ def extract_features(
     full_chroma /= np.sum(full_chroma, axis=0, keepdims=True) + 1e-12
     bass_chroma /= np.sum(bass_chroma, axis=0, keepdims=True) + 1e-12
 
-    return full_chroma, bass_chroma, rms, float(tuning_semitones or 0.0)
+    return (
+        full_chroma,
+        bass_chroma,
+        rms,
+        onset_envelope,
+        float(tuning_semitones or 0.0),
+    )
 
 
 def analyze_audio_file(
@@ -2111,11 +2461,13 @@ def analyze_audio_file(
         raise ValueError("無音部分を除くと音声が短すぎます。")
 
     safe_progress(progress_callback, 0.14, "打楽器成分を抑制中…")
-    full_chroma, bass_chroma, rms, tuning_semitones = extract_features(
-        y,
-        sr,
-        progress_callback,
-    )
+    (
+        full_chroma,
+        bass_chroma,
+        rms,
+        onset_envelope,
+        tuning_semitones,
+    ) = extract_features(y, sr, progress_callback)
 
     # 音声そのものはもう使わないので手放す。
     del y
@@ -2123,6 +2475,26 @@ def analyze_audio_file(
 
     if not np.any(rms > 1e-8):
         raise ValueError("和音・旋律成分を十分に検出できませんでした。")
+
+    tempo_segments = segment_tempo_changes(onset_envelope, sr, duration)
+    if not tempo_segments:
+        tempo_segments = [
+            {
+                "start": 0.0,
+                "end": duration,
+                "duration": duration,
+                **estimate_tempo(onset_envelope, sr),
+            }
+        ]
+
+    # 見出しのBPMは最も長く続いたテンポ区間を採用する。
+    headline_tempo = max(tempo_segments, key=lambda seg: seg["duration"])
+    tempo = {
+        "bpm": headline_tempo["bpm"],
+        "alt_bpm": headline_tempo["alt_bpm"],
+        "confidence": headline_tempo["confidence"],
+    }
+    tempo_changed = len(tempo_segments) > 1
 
     safe_progress(progress_callback, 0.38, "半音移動をスキャン中…")
     raw_candidates = scan_change_candidates(
@@ -2273,6 +2645,30 @@ def analyze_audio_file(
         else "明確な半音移動を伴う転調は検出されませんでした。"
     )
 
+    if tempo_changed:
+        tempo_row_lines = []
+        for index, seg in enumerate(tempo_segments):
+            start_text = format_seconds(seg["start"])
+            end_text = format_seconds(seg["end"])
+            alt_text = f'{seg["alt_bpm"]:.0f} BPM' if seg["alt_bpm"] else "—"
+            confidence_text = f'{seg["confidence"] * 100:.0f}%'
+            tempo_row_lines.append(
+                f'| {index + 1} | {start_text}〜{end_text} '
+                f'| {seg["bpm"]:.0f} BPM | {alt_text} | {confidence_text} |'
+            )
+        tempo_rows = "\n".join(tempo_row_lines)
+        tempo_section = (
+            "\n\n### テンポの変化\n\n"
+            f"曲中で **{len(tempo_segments)}個** のテンポ区間を検出しました。\n\n"
+            "| 区間 | 時間 | BPM | 倍/半の候補 | 信頼度 |\n"
+            "|---|---|---|---|---|\n"
+            f"{tempo_rows}\n\n"
+            "> ハーフタイム／ダブルタイム（拍の取り方が2倍・半分になるだけ）は、"
+            "同じテンポとして扱い、変化には数えていません。"
+        )
+    else:
+        tempo_section = ""
+
     relative_index = relative_key_index(main_key_index)
     relative_gap = float(
         main_scores[main_key_index] - main_scores[relative_index]
@@ -2306,6 +2702,8 @@ def analyze_audio_file(
 |---|---|
 | **推定主調** | **{main_key_text}** |
 | **Camelot** | **{camelot_code(main_key_index)}** |
+| **推定BPM** | **{format_bpm(tempo)}**{"（テンポ変化あり）" if tempo_changed else ""} |
+| BPMの信頼度 | {tempo["confidence"] * 100:.0f}%（{bpm_confidence_label(tempo["confidence"])}） |
 | **参考信頼度** | **{main_confidence:.0f}%（{confidence_label(main_confidence)}）** |
 | 第2候補 | {key_name(second_key_index, notation)} / {camelot_code(second_key_index)} |
 | 開始時のキー | {start_key_text} / {camelot_code(start_key_index)} |
@@ -2321,6 +2719,7 @@ def analyze_audio_file(
 ### 検出した転調
 
 {transition_summary}
+{tempo_section}
 
 ### 判定方法について
 
@@ -2449,6 +2848,21 @@ def analyze_audio_file(
         "ファイル名": Path(audio_path).name,
         "推定主調": main_key_text,
         "開始キー": start_key_text,
+        "推定BPM": round(tempo["bpm"], 1),
+        "BPMの倍半候補": round(tempo["alt_bpm"], 1),
+        "BPMの信頼度": round(tempo["confidence"] * 100.0, 1),
+        "テンポ変化": tempo_changed,
+        "テンポ区間数": len(tempo_segments),
+        "テンポ区間": [
+            {
+                "開始": format_seconds(seg["start"]),
+                "終了": format_seconds(seg["end"]),
+                "BPM": round(seg["bpm"], 1),
+                "倍半候補": round(seg["alt_bpm"], 1),
+                "信頼度": round(seg["confidence"] * 100.0, 1),
+            }
+            for seg in tempo_segments
+        ],
         "参考信頼度": round(main_confidence, 1),
         "転調の可能性": modulation_label,
         "転調信頼度": round(modulation_confidence, 1),
@@ -2484,4 +2898,4 @@ def analyze_audio_file(
     )
 
 
-print("Aryth Key Finder v0.4 Beta engine ready.")
+print("Aryth Key Finder v0.5 Beta engine ready.")
