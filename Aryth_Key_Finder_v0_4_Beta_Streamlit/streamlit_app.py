@@ -16,7 +16,7 @@ from key_analyzer import analyze_audio_file
 
 
 APP_NAME = "Key Finder"
-APP_VERSION = "v0.4 Beta"
+APP_VERSION = "v0.5 Beta"
 
 SUPPORTED_EXTENSIONS = ["mp3", "wav", "m4a", "flac"]
 MAX_UPLOAD_MB = 300
@@ -299,6 +299,17 @@ def render_empty_state() -> None:
     )
 
 
+def format_bpm_metric(details: dict[str, Any]) -> tuple[str, str | None]:
+    bpm = details.get("推定BPM")
+
+    if not bpm:
+        return "—", None
+
+    alt = details.get("BPMの倍半候補")
+    delta = f"倍/半の候補 {alt:.0f}" if alt else None
+    return f"{bpm:.0f} BPM", delta
+
+
 def render_summary_metrics(details: dict[str, Any]) -> None:
     columns = st.columns(4)
 
@@ -306,7 +317,15 @@ def render_summary_metrics(details: dict[str, Any]) -> None:
         "推定主調",
         details.get("推定主調", "—"),
     )
+
+    bpm_value, bpm_delta = format_bpm_metric(details)
     columns[1].metric(
+        "推定BPM",
+        bpm_value,
+        delta=bpm_delta,
+        delta_color="off",
+    )
+    columns[2].metric(
         "参考信頼度",
         (
             f'{details.get("参考信頼度", "—")}%'
@@ -314,13 +333,9 @@ def render_summary_metrics(details: dict[str, Any]) -> None:
             else "—"
         ),
     )
-    columns[2].metric(
+    columns[3].metric(
         "検出した転調",
         f'{details.get("検出転調数", 0)}回',
-    )
-    columns[3].metric(
-        "キーへの復帰",
-        f'{details.get("キーへの復帰回数", 0)}回',
     )
 
 
@@ -412,7 +427,7 @@ st.markdown(
 <section class="aryth-hero">
   <h1 class="aryth-title">{APP_NAME}</h1>
   <p class="aryth-subtitle">
-    楽曲のキー、Camelot表記、複数回の転調、
+    楽曲のキー、Camelot表記、BPM、複数回の転調、
     元キーへの復帰を自動解析する実験版ツールです。
   </p>
   <div class="aryth-badges">
@@ -504,6 +519,11 @@ with st.sidebar:
 - 逆に、構成音が変わらないモーダルインターチェンジ（同主調への変化など）は
   転調として検出されません。
 - コード感の薄い曲やドラム中心の曲では精度が下がります。
+- **BPMは実際の2倍・半分（例：150と75）を取り違えることがあります。**
+  拍だけでは倍か半かを原理的に決められないため、
+  もう一方の候補も併記しています。信頼度が低いときは両方を確認してください。
+- BPMは曲全体で一定と仮定しています。テンポが途中で変わる曲では
+  主要なテンポのみを表示します。
 """
         )
 
