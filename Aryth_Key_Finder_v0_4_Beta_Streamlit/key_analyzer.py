@@ -26,8 +26,10 @@ HOP_LENGTH = 2_048
 # テンポ推定用のオンセット包絡は細かい刻みが要る。
 # HOP_LENGTH(2048)だと1秒あたり約10.8フレームしか無く、
 # たとえば140や150 BPMを整数ラグで表現できずに桁が飛ぶ。
-# 512刻み（約43フレーム/秒）ならこの帯域も十分に分解できる。
-ONSET_HOP_LENGTH = 512
+# 256刻み（約86フレーム/秒）なら速いテンポでもラグの目盛りが十分細かく、
+# 放物線補間と合わせて整数BPMをほぼ正確に復元できる。
+# （512では曲によっては速い帯域で±1程度ずれることがあった）
+ONSET_HOP_LENGTH = 256
 
 BINS_PER_OCTAVE = 36
 N_OCTAVES = 7
@@ -2049,6 +2051,49 @@ def _parabolic_peak_lag(values: np.ndarray, index: int) -> float:
     return float(index) + offset
 
 
+def _refine_bpm_at_lag(
+    autocorrelation: np.ndarray,
+    bpm: float,
+    sr: int,
+    hop: int,
+) -> float:
+    """
+    指定BPMに対応するラグ付近の自己相関ピークを直接補間して精度を上げる。
+
+    遅い倍数（小節単位など）のピークを補間してから整数倍する方式は、
+    その倍率のぶんだけ誤差を拡大してしまう（×4なら誤差も4倍）。
+    そこで最終的に表示するBPMそのもののラグでピークを取り直し、
+    放物線補間する。こうすれば誤差は倍率で増幅されない。
+    """
+    if bpm <= 0.0:
+        return bpm
+
+    target_lag = 60.0 * sr / (hop * bpm)
+    low = max(1, int(np.floor(target_lag)) - 2)
+    high = min(len(autocorrelation) - 2, int(np.ceil(target_lag)) + 2)
+
+    if high <= low:
+        return bpm
+
+    local_index = low + int(np.argmax(autocorrelation[low:high + 1]))
+
+    # 目標ラグ付近に本当に極大がなければ触らない。
+    if not (
+        autocorrelation[local_index] >= autocorrelation[local_index - 1]
+        and autocorrelation[local_index] >= autocorrelation[local_index + 1]
+    ):
+        return bpm
+
+    refined_lag = _parabolic_peak_lag(autocorrelation, local_index)
+    refined_bpm = 60.0 * sr / (hop * refined_lag)
+
+    # 想定から大きく外れる補正は誤りとみなし、元の値を保つ。
+    if abs(refined_bpm - bpm) / bpm > 0.04:
+        return bpm
+
+    return float(refined_bpm)
+
+
 def estimate_tempo(
     onset_envelope: np.ndarray,
     sr: int,
@@ -2112,13 +2157,10 @@ def estimate_tempo(
             )
         )
 
-    # 自己相関は整数ラグ（フレーム単位）でしか値が無いため、BPMが飛び飛びに
-    # 量子化される。たとえば130 BPMはラグ20（129.2 BPM）へ丸められ、
-    # ハーフの65を2倍しても129のままになる。ピーク前後3点に放物線を当てて
-    # 小数ラグの頂点を求め、元の分解能より細かくBPMを復元する。
+    # まず最も強いラグからテンポの「オクターブ（倍/半のどの段か）」を選ぶ。
+    # 選択にはフレーム単位の粗い自己相関で十分。
     peak_lag = int(valid_lags[np.argmax(autocorrelation[valid_lags])])
-    refined_lag = _parabolic_peak_lag(autocorrelation, peak_lag)
-    raw_peak = float(60.0 * sr / (hop * refined_lag))
+    raw_peak = float(60.0 * sr / (hop * peak_lag))
     ratios = (1 / 3, 1 / 2, 2 / 3, 1.0, 3 / 2, 2.0, 3.0)
     candidates = sorted(
         {
@@ -2134,16 +2176,22 @@ def estimate_tempo(
         reverse=True,
     )
 
-    primary = scored[0][0]
+    # 自己相関は整数ラグでしか値が無く、BPMが飛び飛びに量子化される。
+    # 表示する値そのもののラグでピークを取り直して放物線補間する。
+    # 遅い倍数を補間して整数倍する方式（誤差が倍率ぶん拡大する）を避ける。
+    primary = _refine_bpm_at_lag(autocorrelation, scored[0][0], sr, hop)
 
     # 対抗馬は知覚中心の反対側のオクターブ。
     # 遅めに出た代表値（例：88）は速い拍を半分に取った可能性が高いので倍を、
     # 速めに出た代表値には半分を添える。
     if primary <= TEMPO_PRIOR_CENTER:
-        alt = round(primary * 2.0, 1)
+        alt_coarse = primary * 2.0
     else:
-        alt = round(primary / 2.0, 1)
-    if not (TEMPO_MIN_BPM <= alt <= TEMPO_MAX_BPM):
+        alt_coarse = primary / 2.0
+
+    if TEMPO_MIN_BPM <= alt_coarse <= TEMPO_MAX_BPM:
+        alt = _refine_bpm_at_lag(autocorrelation, alt_coarse, sr, hop)
+    else:
         alt = 0.0
 
     confidence = 0.0
@@ -2966,4 +3014,4 @@ def analyze_audio_file(
     )
 
 
-print("Aryth Key Finder v0.5.2 Beta engine ready.")
+print("Aryth Key Finder v0.5.3 Beta engine ready.")
