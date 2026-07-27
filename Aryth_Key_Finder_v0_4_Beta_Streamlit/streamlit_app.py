@@ -16,7 +16,7 @@ from key_analyzer import analyze_audio_file
 
 
 APP_NAME = "Key Finder"
-APP_VERSION = "v0.5.2 Beta"
+APP_VERSION = "v0.5.3 Beta"
 
 SUPPORTED_EXTENSIONS = ["mp3", "wav", "m4a", "flac"]
 MAX_UPLOAD_MB = 300
