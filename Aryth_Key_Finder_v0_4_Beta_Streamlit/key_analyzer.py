@@ -274,6 +274,36 @@ def format_shift(semitones: int) -> str:
     return f"{signed:+d}半音"
 
 
+# libsndfileが直接読める（ffmpeg不要の）形式。
+NATIVE_AUDIO_FORMATS = {"wav", "flac", "ogg", "aiff", "aif"}
+
+
+def _decode_error(suffix: str) -> ValueError:
+    """
+    音声をデコードできなかったときの、原因の分かるエラーを作る。
+
+    m4a/AACやmp3はlibsndfileだけでは読めず、ffmpegが要る。
+    Streamlit Cloudでは packages.txt がリポジトリ直下に無いと
+    ffmpegが入らないため、NoBackendErrorになりやすい。
+    そのままでは空メッセージの例外になり原因が分からないので、
+    形式名と対処をここで添える。
+    """
+    if suffix in NATIVE_AUDIO_FORMATS:
+        return ValueError(
+            f"{suffix} ファイルを読み込めませんでした。"
+            "ファイルが壊れていないか確認してください。"
+        )
+
+    return ValueError(
+        f"{suffix} 形式の読み込みに失敗しました。"
+        "この形式（m4a / mp3 など）のデコードには ffmpeg が必要です。\n\n"
+        "・WAV / FLAC に変換してからアップロードすると確実です。\n"
+        "・自分で運用している場合は、リポジトリ直下に "
+        "`packages.txt`（内容は ffmpeg）を置き、アプリを再起動（Reboot）"
+        "してください。"
+    )
+
+
 def format_bpm(tempo: dict[str, float]) -> str:
     """テンポ推定を人間向けの文字列にする。倍/半の候補も併記する。"""
     bpm = float(tempo.get("bpm", 0.0))
@@ -1995,6 +2025,30 @@ def place_block_feature(
     return True
 
 
+def _parabolic_peak_lag(values: np.ndarray, index: int) -> float:
+    """
+    ピークとその両隣の3点に放物線を当て、小数精度の頂点位置を返す。
+
+    離散的な自己相関から、フレーム間に落ちる本当のピーク位置を推定する。
+    頂点のずれは±0.5ラグに収める（両隣より外れることはないため）。
+    """
+    if index <= 0 or index >= len(values) - 1:
+        return float(index)
+
+    left = float(values[index - 1])
+    center = float(values[index])
+    right = float(values[index + 1])
+
+    denominator = left - 2.0 * center + right
+    if abs(denominator) < 1e-12:
+        return float(index)
+
+    offset = 0.5 * (left - right) / denominator
+    offset = float(np.clip(offset, -0.5, 0.5))
+
+    return float(index) + offset
+
+
 def estimate_tempo(
     onset_envelope: np.ndarray,
     sr: int,
@@ -2031,6 +2085,7 @@ def estimate_tempo(
     bpms = 60.0 * sr / (hop * lags)
 
     in_range = (bpms >= TEMPO_MIN_BPM) & (bpms <= TEMPO_MAX_BPM)
+    valid_lags = lags[in_range]
     bpms = bpms[in_range]
     strength = autocorrelation[1:][in_range]
 
@@ -2057,7 +2112,13 @@ def estimate_tempo(
             )
         )
 
-    raw_peak = float(bpms[np.argmax(strength)])
+    # 自己相関は整数ラグ（フレーム単位）でしか値が無いため、BPMが飛び飛びに
+    # 量子化される。たとえば130 BPMはラグ20（129.2 BPM）へ丸められ、
+    # ハーフの65を2倍しても129のままになる。ピーク前後3点に放物線を当てて
+    # 小数ラグの頂点を求め、元の分解能より細かくBPMを復元する。
+    peak_lag = int(valid_lags[np.argmax(autocorrelation[valid_lags])])
+    refined_lag = _parabolic_peak_lag(autocorrelation, peak_lag)
+    raw_peak = float(60.0 * sr / (hop * refined_lag))
     ratios = (1 / 3, 1 / 2, 2 / 3, 1.0, 3 / 2, 2.0, 3.0)
     candidates = sorted(
         {
@@ -2431,9 +2492,13 @@ def analyze_audio_file(
 
     settings = SENSITIVITY_SETTINGS[sensitivity]
     audio_path = str(audio_path)
+    suffix = Path(audio_path).suffix.lower().lstrip(".") or "?"
 
     safe_progress(progress_callback, 0.02, "音声情報を確認中…")
-    original_duration = float(librosa.get_duration(path=audio_path))
+    try:
+        original_duration = float(librosa.get_duration(path=audio_path))
+    except Exception as error:  # noqa: BLE001
+        raise _decode_error(suffix) from error
 
     if original_duration < MIN_AUDIO_SECONDS:
         raise ValueError(
@@ -2443,11 +2508,14 @@ def analyze_audio_file(
         raise ValueError("現在の試作版では20分以内の音声に対応しています。")
 
     safe_progress(progress_callback, 0.07, "音声を読み込み中…")
-    y, sr = librosa.load(
-        audio_path,
-        sr=SAMPLE_RATE,
-        mono=True,
-    )
+    try:
+        y, sr = librosa.load(
+            audio_path,
+            sr=SAMPLE_RATE,
+            mono=True,
+        )
+    except Exception as error:  # noqa: BLE001
+        raise _decode_error(suffix) from error
 
     if y.size == 0 or not np.any(np.isfinite(y)):
         raise ValueError("音声を正常に読み込めませんでした。")
@@ -2898,4 +2966,4 @@ def analyze_audio_file(
     )
 
 
-print("Aryth Key Finder v0.5 Beta engine ready.")
+print("Aryth Key Finder v0.5.2 Beta engine ready.")
